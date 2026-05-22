@@ -51,7 +51,7 @@ const checkNodeVersion = () => {
     export NVM_DIR="$HOME/.nvm"
     [ -s "$NVM_DIR/nvm.sh" ] && \\. "$NVM_DIR/nvm.sh"
     CURRENT=$(${nodeVersionCommand})
-    LTS=$(nvm view lts --lts --no-colors 2>/dev/null || nvm ls-remote --lts --no-colors | tail -n 1 | awk '{print $1}')
+    LTS=$(nvm ls-remote --lts --no-colors | tail -n 1 | awk '{print $2}')
     echo "$CURRENT|$LTS"
   `;
 
