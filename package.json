@@ -1,0 +1,20 @@
+{
+  "name": "check-node-updates",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "setup": "npm install",
+    "start": "node index.js",
+    "test": "node index.js test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "node-cron": "^4.2.1",
+    "nodemailer": "^8.0.7"
+  }
+}
