@@ -4,100 +4,185 @@ import nodemailer from 'nodemailer';
 import { exec } from 'child_process';
 import log from './utils/logger.js';
 
-let transporter;
+// ---------------------------------------------------------------------------
+// Config & validation
+// ---------------------------------------------------------------------------
 
-// Determine if we are running a one-off test from the CLI arguments
+const REQUIRED_ENV = ['EMAIL_USER', 'EMAIL_PASSWORD', 'EMAIL_TO', 'CRON_SCHEDULE'];
+const SEMVER_RE = /^v\d+\.\d+\.\d+$/;
+const EXEC_TIMEOUT_MS = 30_000;
+
 const isTestMode = process.argv[2] === 'test';
 
-const initializeEmailTransporter = () => {
-  transporter = nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 465,
-    secure: true,
-    auth: {
-      user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASSWORD
-    }
+function validateEnv() {
+  const missing = REQUIRED_ENV.filter(k => !process.env[k]);
+  if (missing.length) {
+    log.error(`Missing required environment variables: ${missing.join(', ')}`);
+    log.error('Create a .env file from .env.example and fill in the values.');
+    process.exit(1);
+  }
+
+  if (!cron.validate(process.env.CRON_SCHEDULE)) {
+    log.error(`Invalid CRON_SCHEDULE value: "${process.env.CRON_SCHEDULE}"`);
+    process.exit(1);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shell helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Run a bash snippet that sources nvm and returns stdout.
+ * Rejects on non-zero exit or timeout.
+ */
+function runBash(script) {
+  return new Promise((resolve, reject) => {
+    const wrapped = `
+      export NVM_DIR="$HOME/.nvm"
+      [ -s "$NVM_DIR/nvm.sh" ] && \\. "$NVM_DIR/nvm.sh" --no-use
+      ${script}
+    `;
+
+    const child = exec(wrapped, { shell: '/bin/bash', timeout: EXEC_TIMEOUT_MS }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(`Shell error: ${error.message}${stderr ? `\nstderr: ${stderr.trim()}` : ''}`));
+        return;
+      }
+      resolve(stdout.trim());
+    });
+
+    // Belt-and-suspenders timeout guard
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`Shell command timed out after ${EXEC_TIMEOUT_MS / 1000}s`));
+    }, EXEC_TIMEOUT_MS + 500);
+
+    child.on('close', () => clearTimeout(timer));
   });
-};
+}
 
-const sendAlertEmail = async (currentVer, ltsVer) => {
-  if (!transporter) initializeEmailTransporter();
+// ---------------------------------------------------------------------------
+// Version resolution
+// ---------------------------------------------------------------------------
 
+async function getCurrentVersion() {
+  if (isTestMode) return 'v0.0.0';
+  const out = await runBash('nvm current');
+  // nvm current may return "none" or "system" if no version is active
+  if (!SEMVER_RE.test(out)) {
+    throw new Error(`nvm current returned unexpected value: "${out}". Is a Node.js version active in nvm?`);
+  }
+  return out;
+}
+
+async function getLatestLtsVersion() {
+  // --no-colors avoids ANSI escapes; tail -n 1 gets the newest entry.
+  // The last line looks like: "->  v22.13.1   (Latest LTS: Jod)"
+  // We extract the first semver token with a regex to be format-agnostic.
+  const out = await runBash('nvm ls-remote --lts --no-colors | tail -n 1');
+  const match = out.match(/v\d+\.\d+\.\d+/);
+  if (!match) {
+    throw new Error(`Could not parse LTS version from nvm output: "${out}"`);
+  }
+  return match[0];
+}
+
+// ---------------------------------------------------------------------------
+// Email
+// ---------------------------------------------------------------------------
+
+let transporter;
+
+function getTransporter() {
+  if (!transporter) {
+    transporter = nodemailer.createTransport({
+      host: 'smtp.gmail.com',
+      port: 465,
+      secure: true,
+      auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASSWORD,
+      },
+    });
+  }
+  return transporter;
+}
+
+async function sendAlertEmail(currentVer, ltsVer) {
   const prefix = isTestMode ? '[TEST RUN] ' : '';
   const mailOptions = {
     from: process.env.EMAIL_USER,
     to: process.env.EMAIL_TO,
-    subject: `⚠️ ${prefix}Node.js Version Update Available`,
-    text: `Your running Node.js version (${currentVer}) is different from the latest available LTS version (${ltsVer}). Consider upgrading.`,
-    html: `<p>Your running Node.js version (<strong>${currentVer}</strong>) is different from the latest available LTS version (<strong>${ltsVer}</strong>).</p><p>Consider upgrading your environment.</p>`
+    subject: `⚠️ ${prefix}Node.js update available: ${currentVer} → ${ltsVer}`,
+    text: [
+      `Your active Node.js version (${currentVer}) differs from the latest LTS (${ltsVer}).`,
+      ``,
+      `To upgrade:`,
+      `  nvm install --lts`,
+      `  nvm alias default lts/*`,
+    ].join('\n'),
+    html: `
+      <p>Your active Node.js version (<strong>${currentVer}</strong>) differs from
+      the latest LTS (<strong>${ltsVer}</strong>).</p>
+      <p>To upgrade:</p>
+      <pre>nvm install --lts\nnvm alias default lts/*</pre>
+    `,
   };
 
-  try {
-    const info = await transporter.sendMail(mailOptions);
-    log.info(`Alert email sent successfully: ${info.messageId}`);
-  } catch (error) {
-    log.error(`Failed to send email:`, error);
-  }
-};
+  const info = await getTransporter().sendMail(mailOptions);
+  log.info(`Alert email sent: ${info.messageId}`);
+}
 
-const checkNodeVersion = () => {
+// ---------------------------------------------------------------------------
+// Main check
+// ---------------------------------------------------------------------------
+
+async function checkNodeVersion() {
   log.info(`Running version check${isTestMode ? ' (TEST MODE)' : ''}...`);
 
-  // If in test mode, we hardcode CURRENT to v0.0.0
-  const nodeVersionCommand = isTestMode ? 'echo "v0.0.0"' : 'node -v';
+  let currentVersion, ltsVersion;
 
-  // We explicitly add --no-colors to suppress any terminal color escapes natively
-  const bashCommand = `
-    export NVM_DIR="$HOME/.nvm"
-    [ -s "$NVM_DIR/nvm.sh" ] && \\. "$NVM_DIR/nvm.sh"
-    CURRENT=$(${nodeVersionCommand})
-    LTS=$(nvm ls-remote --lts --no-colors | tail -n 1 | awk '{print $2}')
-    echo "$CURRENT|$LTS"
-  `;
+  try {
+    [currentVersion, ltsVersion] = await Promise.all([
+      getCurrentVersion(),
+      getLatestLtsVersion(),
+    ]);
+  } catch (err) {
+    log.error(`Version resolution failed: ${err.message}`);
+    return;
+  }
 
-  exec(bashCommand, { shell: '/bin/bash' }, (error, stdout, stderr) => {
-    if (error) {
-      log.error(`Execution error: ${error.message}`);
-      return;
-    }
+  log.info(`Current: ${currentVersion}  |  Latest LTS: ${ltsVersion}`);
 
-    const output = stdout.trim();
-    if (!output.includes('|')) {
-      log.error(`Unexpected output format: ${output}`);
-      return;
-    }
+  if (currentVersion === ltsVersion) {
+    log.info('Node.js is up to date with the latest LTS. Nothing to do.');
+    return;
+  }
 
-    // Split and cleanly map away any remaining surrounding whitespace or line-breaks
-    const [currentVersion, ltsVersion] = output.split('|').map(v => v.trim());
+  log.info(`Mismatch detected (${currentVersion} ≠ ${ltsVersion}). Sending alert email...`);
 
-    log.info(`Evaluated Version: ${currentVersion} | Latest LTS: ${ltsVersion}`);
+  try {
+    await sendAlertEmail(currentVersion, ltsVersion);
+  } catch (err) {
+    log.error(`Failed to send alert email: ${err.message}`);
+  }
+}
 
-    if (!ltsVersion) {
-      log.error('Error: Could not retrieve latest LTS version from nvm.');
-      return;
-    }
+// ---------------------------------------------------------------------------
+// Entrypoint
+// ---------------------------------------------------------------------------
 
-    if (currentVersion !== ltsVersion) {
-      log.info('Mismatch detected. Triggering email...');
-      sendAlertEmail(currentVersion, ltsVersion);
-    } else {
-      log.info('Node.js is up to date with the latest LTS.');
-    }
-  });
-};
-
-// Execution Flow Logic
 if (isTestMode) {
-  log.info('Executing a single test run with mock version v0.0.0...');
+  log.info('Single test run with mock version v0.0.0...');
   checkNodeVersion();
 } else {
-  // Production Routine: Run on schedule
+  validateEnv();
+
   cron.schedule(process.env.CRON_SCHEDULE, () => {
     checkNodeVersion();
   });
 
-  log.info('Node.js version monitor service started. Cron scheduled for daily checks.');
-  // Initial check on production startup
-  checkNodeVersion();
+  log.info(`Node.js version monitor started. Schedule: "${process.env.CRON_SCHEDULE}"`);
+  checkNodeVersion(); // immediate check on startup
 }
