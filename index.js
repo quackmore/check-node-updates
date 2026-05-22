@@ -2,6 +2,7 @@ import 'dotenv/config';
 import cron from 'node-cron';
 import nodemailer from 'nodemailer';
 import { exec } from 'child_process';
+import log from './utils/logger.js';
 
 let transporter;
 
@@ -34,14 +35,14 @@ const sendAlertEmail = async (currentVer, ltsVer) => {
 
   try {
     const info = await transporter.sendMail(mailOptions);
-    console.log(`[${new Date().toISOString()}] Alert email sent successfully: ${info.messageId}`);
+    log.info(`Alert email sent successfully: ${info.messageId}`);
   } catch (error) {
-    console.error(`[${new Date().toISOString()}] Failed to send email:`, error);
+    log.error(`Failed to send email:`, error);
   }
 };
 
 const checkNodeVersion = () => {
-  console.log(`[${new Date().toISOString()}] Running version check${isTestMode ? ' (TEST MODE)' : ''}...`);
+  log.info(`Running version check${isTestMode ? ' (TEST MODE)' : ''}...`);
 
   // If in test mode, we hardcode CURRENT to v0.0.0
   const nodeVersionCommand = isTestMode ? 'echo "v0.0.0"' : 'node -v';
@@ -57,38 +58,38 @@ const checkNodeVersion = () => {
 
   exec(bashCommand, { shell: '/bin/bash' }, (error, stdout, stderr) => {
     if (error) {
-      console.error(`Execution error: ${error.message}`);
+      log.error(`Execution error: ${error.message}`);
       return;
     }
 
     const output = stdout.trim();
     if (!output.includes('|')) {
-      console.error(`Unexpected output format: ${output}`);
+      log.error(`Unexpected output format: ${output}`);
       return;
     }
 
     // Split and cleanly map away any remaining surrounding whitespace or line-breaks
     const [currentVersion, ltsVersion] = output.split('|').map(v => v.trim());
 
-    console.log(`Evaluated Version: ${currentVersion} | Latest LTS: ${ltsVersion}`);
+    log.info(`Evaluated Version: ${currentVersion} | Latest LTS: ${ltsVersion}`);
 
     if (!ltsVersion) {
-      console.error('Error: Could not retrieve latest LTS version from nvm.');
+      log.error('Error: Could not retrieve latest LTS version from nvm.');
       return;
     }
 
     if (currentVersion !== ltsVersion) {
-      console.log('Mismatch detected. Triggering email...');
+      log.info('Mismatch detected. Triggering email...');
       sendAlertEmail(currentVersion, ltsVersion);
     } else {
-      console.log('Node.js is up to date with the latest LTS.');
+      log.info('Node.js is up to date with the latest LTS.');
     }
   });
 };
 
 // Execution Flow Logic
 if (isTestMode) {
-  console.log('Executing a single test run with mock version v0.0.0...');
+  log.info('Executing a single test run with mock version v0.0.0...');
   checkNodeVersion();
 } else {
   // Production Routine: Run on schedule
@@ -96,7 +97,7 @@ if (isTestMode) {
     checkNodeVersion();
   });
 
-  console.log('Node.js version monitor service started. Cron scheduled for daily checks.');
+  log.info('Node.js version monitor service started. Cron scheduled for daily checks.');
   // Initial check on production startup
   checkNodeVersion();
 }
